@@ -1,0 +1,342 @@
+IjkPlayer 网络电台播放器 - 独立开发大纲
+一、项目概述
+开发一个 Android 网络电台 App，使用 Bilibili IjkPlayer 作为播放核心，支持：
+
+电台列表展示（名称 + URL）
+
+添加/删除电台
+
+播放/暂停 MP3 网络流
+
+音量调节
+
+自动恢复上次播放的电台
+
+播放状态提示（缓冲、播放、错误）
+
+二、开发环境
+Android Studio Hedgehog | 2023.1.1+
+
+minSdk = 21, targetSdk = 33
+
+Kotlin 1.9+
+
+Gradle 8.0+
+
+三、项目依赖（build.gradle 模块级）
+groovy
+dependencies {
+    implementation 'androidx.core:core-ktx:1.12.0'
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.11.0'
+    implementation 'androidx.recyclerview:recyclerview:1.3.2'
+    implementation 'com.google.code.gson:gson:2.10.1'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.7.0'
+
+    // IjkPlayer 核心与 SO 库（以 armv7a 为例）
+    implementation 'tv.danmaku.ijk.media:ijkplayer-java:0.8.8'
+    implementation 'tv.danmaku.ijk.media:ijkplayer-armv7a:0.8.8'
+}
+四、AndroidManifest.xml 配置
+xml
+<uses-permission android:name="android.permission.INTERNET" />
+<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+<application
+    android:allowBackup="true"
+    android:usesCleartextTraffic="true"
+    android:theme="@style/Theme.AppCompat.Light.DarkActionBar">
+    <activity android:name=".MainActivity" android:exported="true">
+        <intent-filter>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent-filter>
+    </activity>
+</application>
+五、文件结构与职责
+text
+app/src/main/java/com/example/ijkradio/
+├── MainActivity.kt               # 主界面，管理 UI 与播放器交互
+├── data/
+│   ├── Station.kt                # 数据类：name, url
+│   └── StationStorage.kt         # 使用 SharedPreferences + Gson 存储电台列表
+├── player/
+│   ├── PlaybackState.kt          # 播放状态密封类
+│   └── IjkPlayerManager.kt       # IjkMediaPlayer 单例封装，处理播放逻辑
+├── ui/
+│   └── StationAdapter.kt         # RecyclerView 适配器，显示电台列表
+└── utils/
+    └── NetworkHelper.kt          # 可选：检测网络连通性
+六、各模块详细设计（含代码骨架）
+6.1 Station.kt
+kotlin
+package com.example.ijkradio.data
+
+data class Station(val name: String, val url: String)
+6.2 PlaybackState.kt
+kotlin
+package com.example.ijkradio.player
+
+sealed class PlaybackState {
+    object Stopped : PlaybackState()
+    object Buffering : PlaybackState()
+    data class Playing(val stationName: String) : PlaybackState()
+    object Paused : PlaybackState()
+    data class Error(val message: String) : PlaybackState()
+}
+6.3 StationStorage.kt
+使用 SharedPreferences 保存 List<Station> 的 JSON 字符串
+
+提供 loadStations(): MutableList<Station>、saveStations(stations: List<Station>)
+
+提供 saveLastPlayed(station: Station)、getLastPlayed(): Station?
+
+内置默认电台列表（同原 Python 版）
+
+关键代码片段：
+
+kotlin
+private val gson = Gson()
+private val prefs: SharedPreferences = context.getSharedPreferences("radio_prefs", Context.MODE_PRIVATE)
+
+fun loadStations(): MutableList<Station> {
+    val json = prefs.getString(STATIONS_KEY, null)
+    return if (json != null) {
+        gson.fromJson(json, object : TypeToken<MutableList<Station>>() {}.type)
+    } else {
+        defaultStations()
+    }
+}
+6.4 IjkPlayerManager.kt（核心）
+单例模式，持有 IjkMediaPlayer 实例
+
+初始化：加载 native 库，设置播放选项（硬解码、缓冲、重连）
+
+实现 IMediaPlayer 的各种监听器，通过 LiveData 或 StateFlow 发送 PlaybackState
+
+公开方法：playStation(station: Station)、pause()、resume()、stop()、setVolume(volume: Float)、isPlaying(): Boolean、release()
+
+关键代码骨架：
+
+kotlin
+class IjkPlayerManager private constructor(context: Context) {
+    private var ijkPlayer: IjkMediaPlayer? = null
+    private val _state = MutableStateFlow<PlaybackState>(PlaybackState.Stopped)
+    val state: StateFlow<PlaybackState> = _state.asStateFlow()
+
+    init {
+        IjkMediaPlayer.loadLibrariesOnce(null)
+        IjkMediaPlayer.nativeProfileBegin("libijkplayer.so")
+        initPlayer()
+    }
+
+    private fun initPlayer() {
+        ijkPlayer = IjkMediaPlayer().apply {
+            setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec", 1)
+            setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "opensles", 1)
+            setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "start-on-prepared", 1)
+            setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "reconnect", 5)
+            setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max-buffer-size", 1024 * 1024)
+
+            setOnPreparedListener {
+                start()
+                _state.value = PlaybackState.Playing(currentStation?.name ?: "")
+            }
+            setOnErrorListener { _, what, extra ->
+                _state.value = PlaybackState.Error("播放错误 [$what,$extra]")
+                false
+            }
+            setOnCompletionListener {
+                _state.value = PlaybackState.Stopped
+            }
+            setOnInfoListener { _, what, _ ->
+                when (what) {
+                    IMediaPlayer.MEDIA_INFO_BUFFERING_START -> _state.value = PlaybackState.Buffering
+                    IMediaPlayer.MEDIA_INFO_BUFFERING_END -> {
+                        if (isPlaying()) {
+                            _state.value = PlaybackState.Playing(currentStation?.name ?: "")
+                        }
+                    }
+                }
+                true
+            }
+        }
+    }
+
+    fun playStation(station: Station) {
+        currentStation = station
+        ijkPlayer?.apply {
+            dataSource = station.url
+            prepareAsync()
+        }
+        _state.value = PlaybackState.Buffering
+    }
+
+    fun pause() { ijkPlayer?.pause() }
+    fun resume() { ijkPlayer?.start() }
+    fun stop() { ijkPlayer?.stop(); ijkPlayer?.reset(); currentStation = null; _state.value = PlaybackState.Stopped }
+    fun isPlaying(): Boolean = ijkPlayer?.isPlaying() ?: false
+    fun setVolume(volume: Float) { ijkPlayer?.setVolume(volume, volume) }
+    fun release() { stop(); ijkPlayer?.release(); ijkPlayer = null; IjkMediaPlayer.nativeProfileEnd() }
+
+    companion object {
+        @Volatile private var INSTANCE: IjkPlayerManager? = null
+        fun getInstance(context: Context): IjkPlayerManager = INSTANCE ?: synchronized(this) {
+            INSTANCE ?: IjkPlayerManager(context.applicationContext).also { INSTANCE = it }
+        }
+    }
+}
+6.5 StationAdapter.kt
+继承 RecyclerView.Adapter
+
+使用 ItemStationBinding（ViewBinding）或自定义布局 item_station.xml
+
+显示电台名称和 URL
+
+点击事件回调 (Station) -> Unit
+
+6.6 MainActivity.kt
+设置 ViewBinding
+
+初始化 StationStorage、IjkPlayerManager
+
+设置 RecyclerView 和适配器
+
+观察播放器状态，更新 UI（按钮文字、状态文本）
+
+实现“添加电台”对话框（使用 AlertDialog + 自定义布局）
+
+实现“删除电台”：获取选中位置，删除并保存，若正在播放则停止
+
+“播放/暂停”按钮逻辑：根据当前状态调用播放器对应方法
+
+音量滑块：绑定 seekBar 的进度到 playerManager.setVolume()
+
+在 onDestroy 中调用 playerManager.release()
+
+恢复上次播放：onCreate 中获取 storage.getLastPlayed() 并播放
+
+关键代码片段：
+
+kotlin
+override fun onCreate(savedInstanceState: Bundle?) {
+    super.onCreate(savedInstanceState)
+    binding = ActivityMainBinding.inflate(layoutInflater)
+    setContentView(binding.root)
+
+    storage = StationStorage(this)
+    playerManager = IjkPlayerManager.getInstance(this)
+
+    setupRecyclerView()
+    setupButtons()
+    observePlayerState()
+    restoreLastPlayed()
+}
+
+private fun observePlayerState() {
+    lifecycleScope.launch {
+        playerManager.state.collect { state ->
+            when (state) {
+                is PlaybackState.Playing -> {
+                    binding.buttonPlayPause.text = "停止"
+                    binding.textStatus.text = "正在播放: ${state.stationName}"
+                }
+                is PlaybackState.Buffering -> binding.textStatus.text = "缓冲中..."
+                is PlaybackState.Paused -> {
+                    binding.buttonPlayPause.text = "播放"
+                    binding.textStatus.text = "已暂停"
+                }
+                is PlaybackState.Stopped -> {
+                    binding.buttonPlayPause.text = "播放"
+                    binding.textStatus.text = "已停止"
+                }
+                is PlaybackState.Error -> {
+                    binding.textStatus.text = "错误: ${state.message}"
+                    Toast.makeText(this@MainActivity, state.message, Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+}
+七、布局文件（res/layout）
+7.1 activity_main.xml
+垂直 LinearLayout
+
+顶部两个按钮：添加、删除
+
+RecyclerView（占据大部分空间）
+
+播放/暂停按钮
+
+音量控制：TextView + SeekBar + TextView
+
+状态 TextView
+
+7.2 item_station.xml
+垂直 LinearLayout 或 CardView
+
+两个 TextView：电台名称（加粗）、URL（小字灰色）
+
+7.3 dialog_add_station.xml
+垂直 LinearLayout
+
+两个 EditText：电台名称、URL
+
+八、编译与运行注意事项
+SO 库架构：确保添加的 IjkPlayer 库与设备 CPU 架构一致。真机通常是 arm64-v8a，需将依赖改为 ijkplayer-arm64。如果同时包含多个架构可能导致包体积增大，但可接受。
+
+网络权限：Android 9+ 默认禁止 HTTP 明文传输，必须在 manifest 中启用 usesCleartextTraffic="true"。
+
+IjkPlayer 初始化：必须在播放前调用 IjkMediaPlayer.loadLibrariesOnce(null)，且在 Application 或首次获取单例时执行。
+
+释放资源：onDestroy 中必须调用 release()，否则可能造成 native 内存泄漏。
+
+九、调试与常见问题
+问题	可能原因	解决方案
+无法播放，logcat 无错误	硬解码不兼容	在 initPlayer 中将 mediacodec 设为 0 关闭硬解
+播放几秒后无声	音频输出问题	禁用 opensles（设为 0），回退到 AudioTrack
+缓冲时间过长	默认缓冲策略保守	减小 max-buffer-size 或增加 min-frames
+切换电台崩溃	未正确 reset	调用 stop() 后再 reset()，再设置新 dataSource
+后台播放被杀死	未使用前台 Service	需将播放器移至 ForegroundService 并添加通知
+十、扩展功能（可选）
+后台播放：创建 RadioService，将 IjkPlayerManager 迁移至服务中运行。
+
+通知栏控制：添加 MediaStyle 通知，允许在锁屏界面控制播放。
+
+均衡器：集成 android.media.audiofx.Equalizer。
+
+搜索电台：添加搜索框过滤列表。
+
+导入/导出电台：通过文件选择器导入 JSON 或 M3U 文件。
+
+十一、交付物清单
+按照此大纲，AI 应生成以下完整文件（可直接复制到 Android Studio 编译运行）：
+
+MainActivity.kt
+
+Station.kt
+
+StationStorage.kt
+
+PlaybackState.kt
+
+IjkPlayerManager.kt
+
+StationAdapter.kt
+
+activity_main.xml
+
+item_station.xml
+
+dialog_add_station.xml
+
+AndroidManifest.xml
+
+build.gradle (Module: app)
+
+strings.xml（基础字符串）
+
+所有文件不依赖任何外部示例代码，完全独立。
+
+这份大纲可以直接交给任何具备代码生成能力的 AI，按顺序实现每个模块即可得到一个完整的 IjkPlayer 网络电台播放器。
