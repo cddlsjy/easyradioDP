@@ -33,10 +33,12 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
 
-      # 不再需要 chmod +x gradlew
+      # ✅ 新增：清除 Gradle 缓存和旧构建产物
+      - name: Clean Gradle cache
+        run: gradle clean --no-daemon
 
       - name: Build APK
-        run: gradle assembleDebug --stacktrace --no-daemon   # 改为 gradle
+        run: gradle assembleDebug --stacktrace --no-daemon
 
       - name: Find and upload APK
         id: find_apk
