@@ -1,8 +1,9 @@
 package com.example.ijkradio.player
 
 import android.content.Context
-import tv.danmaku.ijk.media.IjkMediaPlayer
-import tv.danmaku.ijk.media.player.IMediaPlayer
+import android.media.AudioManager
+import android.media.MediaPlayer
+import android.net.Uri
 import com.example.ijkradio.data.Station
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -10,25 +11,20 @@ import kotlinx.coroutines.flow.asStateFlow
 
 class IjkPlayerManager private constructor(context: Context) {
 
-    private var ijkPlayer: IjkMediaPlayer? = null
+    private var mediaPlayer: MediaPlayer? = null
     private var currentStation: Station? = null
+    private val appContext = context.applicationContext
 
     private val _state = MutableStateFlow<PlaybackState>(PlaybackState.Stopped)
     val state: StateFlow<PlaybackState> = _state.asStateFlow()
 
     init {
-        IjkMediaPlayer.loadLibrariesOnce(null)
-        IjkMediaPlayer.nativeProfileBegin("libijkplayer.so")
         initPlayer()
     }
 
     private fun initPlayer() {
-        ijkPlayer = IjkMediaPlayer().apply {
-            setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec", 1)
-            setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "opensles", 1)
-            setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "start-on-prepared", 1)
-            setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "reconnect", 5)
-            setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max-buffer-size", 1024 * 1024)
+        mediaPlayer = MediaPlayer().apply {
+            setAudioStreamType(AudioManager.STREAM_MUSIC)
 
             setOnPreparedListener {
                 start()
@@ -41,59 +37,57 @@ class IjkPlayerManager private constructor(context: Context) {
             setOnCompletionListener {
                 _state.value = PlaybackState.Stopped
             }
-            setOnInfoListener { _, what, _ ->
-                when (what) {
-                    IMediaPlayer.MEDIA_INFO_BUFFERING_START -> _state.value = PlaybackState.Buffering
-                    IMediaPlayer.MEDIA_INFO_BUFFERING_END -> {
-                        if (isPlaying()) {
-                            _state.value = PlaybackState.Playing(currentStation?.name ?: "")
-                        }
+            setOnBufferingUpdateListener { _, percent ->
+                if (percent < 100) {
+                    if (_state.value !is PlaybackState.Buffering) {
+                        _state.value = PlaybackState.Buffering
+                    }
+                } else {
+                    if (isPlaying) {
+                        _state.value = PlaybackState.Playing(currentStation?.name ?: "")
                     }
                 }
-                true
             }
         }
     }
 
     fun playStation(station: Station) {
         currentStation = station
-        ijkPlayer?.apply {
-            stop()
+        mediaPlayer?.apply {
             reset()
-            dataSource = station.url
+            setDataSource(appContext, Uri.parse(station.url))
             prepareAsync()
         }
         _state.value = PlaybackState.Buffering
     }
 
     fun pause() {
-        ijkPlayer?.pause()
+        mediaPlayer?.pause()
         _state.value = PlaybackState.Paused
     }
 
     fun resume() {
-        ijkPlayer?.start()
+        mediaPlayer?.start()
         _state.value = PlaybackState.Playing(currentStation?.name ?: "")
     }
 
     fun stop() {
-        ijkPlayer?.stop()
-        ijkPlayer?.reset()
+        mediaPlayer?.stop()
+        mediaPlayer?.reset()
         currentStation = null
         _state.value = PlaybackState.Stopped
     }
 
-    fun isPlaying(): Boolean = ijkPlayer?.isPlaying() ?: false
+    fun isPlaying(): Boolean = mediaPlayer?.isPlaying ?: false
 
     fun setVolume(volume: Float) {
-        ijkPlayer?.setVolume(volume, volume)
+        mediaPlayer?.setVolume(volume, volume)
     }
 
     fun release() {
         stop()
-        ijkPlayer?.release()
-        ijkPlayer = null
-        IjkMediaPlayer.nativeProfileEnd()
+        mediaPlayer?.release()
+        mediaPlayer = null
     }
 
     companion object {
